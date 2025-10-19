@@ -21,26 +21,21 @@ class Config:
     rsi_high: float = 60.0           # long if RSI > rsi_high
     rsi_low: float = 40.0            # short if RSI < rsi_low
     atr_period: int = 30
-    atr_multiple: float = 0.95       # bracket distance = multiple * ATR
+    atr_multiple: float = 0.95       # TP/SL distance = multiple * ATR
 
-    # Sizing
     use_fixed_notional: bool = True
     fixed_usdt_notional: float = 50.0
     fixed_quantity: float = 1.0
 
     leverage: int = 5
-    poll_interval_sec: float = 0.5
+    poll_interval_sec: float = 0.5   # faster poll helps catch bar open easily
 
     # Bar-open detection grace (seconds from exact open)
     entry_open_grace_sec: float = 10.0
 
-    # Exit order behavior
-    # SL STOP-LIMIT (cheaper) by default; set True to use STOP-MARKET for safer fills.
+    # SL behavior: STOP-LIMIT (reduce-only) by default (cheaper), or STOP-MARKET (safer fills)
     sl_use_stop_market: bool = False
     stop_limit_ticks: int = 3         # ticks offset for SL limit price
-
-    # Bracket anchoring and safety
-    min_buffer_ticks: int = 2         # ensure TP/SL at least N ticks away from fill after rounding
 
     # Logging
     verbose: bool = True
@@ -89,6 +84,7 @@ def futures_filters(client: Client, symbol: str) -> Dict[str, float]:
 
 
 def server_time_ms(client: Client) -> int:
+    # futures_time may not exist on older libs; fallback to get_server_time
     try:
         return int(client.futures_time()["serverTime"])
     except Exception:
@@ -175,7 +171,7 @@ class RSIAtrBot:
         # Position state
         self.in_position = False
         self.side = None
-        self.entry_fill = None
+        self.entry_open = None
         self.tp = None
         self.sl = None
         self.bar_open_ms = None
@@ -194,7 +190,6 @@ class RSIAtrBot:
         return max(qty, 0.0)
 
     def place_exit_orders(self, side: str, qty: float, tp_price: float, sl_trigger: float):
-        # Cancel residuals first
         cancel_all_open_orders(self.client, self.cfg.symbol)
 
         # TP LIMIT (reduce-only)
@@ -232,13 +227,14 @@ class RSIAtrBot:
                 sl_limit = clamp_tick(max(sl_trigger - offset, 0.0), tick) if tick > 0 else sl_trigger
             else:
                 sl_limit = clamp_tick(sl_trigger + offset, tick) if tick > 0 else sl_trigger
+
             sl = self.client.futures_create_order(
                 symbol=self.cfg.symbol,
                 side=sl_side,
                 type="STOP",                # stop-limit
                 timeInForce="GTC",
                 quantity=str(qty),
-                price=f"{sl_limit:.10f}",   # limit price
+                price=f"{sl_limit:.10f}",
                 stopPrice=f"{sl_trigger:.10f}",
                 reduceOnly="true",
                 workingType="MARK_PRICE",
@@ -265,9 +261,12 @@ class RSIAtrBot:
             self.log("[SKIP] insufficient klines")
             return
 
+        # last closed bar is df.iloc[-2], forming is df.iloc[-1]
         last_closed = df.iloc[-2]
         forming = df.iloc[-1]
+        # sanity: forming.open should equal last_closed.close
         ref_open = float(forming["open"])
+        last_close = float(last_closed["close"])
 
         # Indicators on fully closed data
         df_sig = df.iloc[:-1].copy()
@@ -288,42 +287,39 @@ class RSIAtrBot:
             side = "LONG"
         elif rsi_last < self.cfg.rsi_low:
             side = "SHORT"
+
         if side is None:
             self.log("[NO SIGNAL] RSI within band")
             return
 
-        # Compute size using current mark (more stable than ref_open)
-        current = mark_price(self.client, self.cfg.symbol)
-        qty = self.compute_qty(current)
+        dist = self.cfg.atr_multiple * atr_last
+        if not math.isfinite(dist) or dist <= 0:
+            self.log("[SKIP] invalid ATR distance")
+            return
+
+        qty = self.compute_qty(ref_open)
         if qty <= 0:
             self.log("[SKIP] qty rounded to 0; adjust notional/quantity")
             return
 
-        # 1) Enter at market
-        entry_side = "BUY" if side == "LONG" else "SELL"
-        self.log(f"[ENTRY @ OPEN] {side} qty={qty} ref_open={ref_open:.8f} current={current:.8f}")
+        if side == "LONG":
+            tp = clamp_tick(ref_open + dist, self.tick)
+            sl = clamp_tick(ref_open - dist, self.tick)
+            entry_side = "BUY"
+        else:
+            tp = clamp_tick(ref_open - dist, self.tick)
+            sl = clamp_tick(ref_open + dist, self.tick)
+            entry_side = "SELL"
+
+        self.log(f"[ENTRY @ OPEN] {side} qty={qty} ref_open={ref_open:.8f} (prev_close={last_close:.8f}) TP={tp:.8f} SL={sl:.8f}")
         try:
-            entry_res = market_order(self.client, self.cfg.symbol, entry_side, qty, reduce_only=False)
-            self.log(f"Entry: {entry_res}")
+            res = market_order(self.client, self.cfg.symbol, entry_side, qty, reduce_only=False)
+            self.log(f"Entry: {res}")
         except BinanceAPIException as e:
             self.log(f"[ENTRY FAILED] {e}")
             return
 
-        # 2) Anchor brackets to actual fill price (symmetric around the fill)
-        entry_px = float(entry_res.get("avgPrice") or current)
-        dist = self.cfg.atr_multiple * atr_last
-
-        tick = self.tick if self.tick > 0 else 0.0
-        buffer = (self.cfg.min_buffer_ticks * tick) if tick > 0 else 0.0
-
-        if side == "LONG":
-            tp = clamp_tick(max(entry_px + dist, entry_px + buffer), tick)
-            sl = clamp_tick(min(entry_px - dist, entry_px - buffer), tick)
-        else:  # SHORT
-            tp = clamp_tick(min(entry_px - dist, entry_px - buffer), tick)
-            sl = clamp_tick(max(entry_px + dist, entry_px + buffer), tick)
-
-        # 3) Place exit orders immediately
+        # Place exits immediately
         try:
             self.place_exit_orders(side, qty, tp, sl)
         except BinanceAPIException as e:
@@ -334,15 +330,15 @@ class RSIAtrBot:
                 pass
             return
 
-        # 4) Update state
+        # Update state
         self.in_position = True
         self.side = side
-        self.entry_fill = entry_px
+        self.entry_open = ref_open
         self.tp = tp
         self.sl = sl
         self.bar_open_ms = bar_open_ms
         self.bar_close_ms = bar_open_ms + self.interval_ms
-        self.log(f"[STATE] entry_fill={entry_px:.10f} TP={tp:.10f} SL={sl:.10f} | bar_close_ms={self.bar_close_ms}")
+        self.log(f"[STATE] bar_open_ms={self.bar_open_ms} bar_close_ms={self.bar_close_ms}")
 
     def close_position_market(self):
         amt = position_amt(self.client, self.cfg.symbol)
@@ -377,7 +373,7 @@ class RSIAtrBot:
     def _reset_pos(self):
         self.in_position = False
         self.side = None
-        self.entry_fill = None
+        self.entry_open = None
         self.tp = None
         self.sl = None
         self.bar_open_ms = None
@@ -423,7 +419,6 @@ def main():
         entry_open_grace_sec=float(os.getenv("BOT_ENTRY_OPEN_GRACE_SEC", "10.0")),
         sl_use_stop_market=(os.getenv("BOT_SL_USE_STOP_MARKET", "false").lower() == "true"),
         stop_limit_ticks=int(os.getenv("BOT_STOP_LIMIT_TICKS", "3")),
-        min_buffer_ticks=int(os.getenv("BOT_MIN_BUFFER_TICKS", "2")),
         verbose=(os.getenv("BOT_VERBOSE", "true").lower() == "true"),
     )
 
