@@ -436,8 +436,6 @@ class RSIAtrBot:
             if age_after_close <= int(self.cfg.entry_open_grace_sec * 1000) and self.last_seen_open_ms == current_open_ms:
                 self.log("[LOG] Re-attempting entry after time-stop closure in same bar")
                 self.on_bar_open(current_open_ms)
-        else:
-            self.log("[LOG] Position open - waiting for time-stop or TP/SL")
 
     def _reset_pos(self):
         self.in_position = False
@@ -476,11 +474,11 @@ def main():
 
     cfg = Config(
         symbol=os.getenv("BOT_SYMBOL", "SPXUSDT"),
-        interval=os.getenv("BOT_INTERVAL", "5m"),
-        rsi_period=int(os.getenv("BOT_RSI_PERIOD", "14")),
-        rsi_high=float(os.getenv("BOT_RSI_HIGH", "52.5")),
+        interval=os.getenv("BOT_INTERVAL", "1h"),
+        rsi_period=int(os.getenv("BOT_RSI_PERIOD", "30")),
+        rsi_high=float(os.getenv("BOT_RSI_HIGH", "57.5")),
         rsi_low=float(os.getenv("BOT_RSI_LOW", "42.5")),
-        atr_period=int(os.getenv("BOT_ATR_PERIOD", "14")),
+        atr_period=int(os.getenv("BOT_ATR_PERIOD", "30")),
         atr_multiple=float(os.getenv("BOT_ATR_MULTIPLE", "0.95")),
         use_fixed_notional=(os.getenv("BOT_USE_FIXED_NOTIONAL", "true").lower() == "true"),
         fixed_usdt_notional=float(os.getenv("BOT_FIXED_USDT_NOTIONAL", "100")),
